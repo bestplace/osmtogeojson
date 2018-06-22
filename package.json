@@ -37,9 +37,11 @@
     "mongodb": "^3.0.10",
     "mongoose": "^5.1.6",
     "optimist": "~0.3.5",
+    "osm-pbf-parser": "^2.3.0",
     "osm-polygon-features": "^0.9.1",
     "progress": "^2.0.0",
     "progress-bar": "^0.1.1",
+    "through2": "^2.0.3",
     "tiny-osmpbf": "^0.1.0",
     "xmldom": "~0.1.16"
   },

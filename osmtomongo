@@ -1,101 +1,84 @@
 #!/usr/bin/env node
 
 var _ = require("lodash");
+var fs = require('fs');
+var through = require('through2');
+var parseOSM = require('osm-pbf-parser');
+var ProgressBar = require('ascii-progress');
+
 var osmtogeojson = require('./'),
     opt = require('optimist')
         .usage('Usage: $0 [-f format] [-e] [-v] FILE')
-        .string('f').describe('f', 'file format. if not given, will be detected from filename. supported values: osm, json')
-        .boolean('e').describe('e', 'enhanced properties. if set, the resulting GeoJSON feature\'s properties will contain more structured information')
-        .boolean('n').describe('n', 'numeric properties. if set, the resulting GeoJSON feature\'s properties will be numbers if possible')
-        .boolean('v').describe('v', 'verbose mode. output diagnostic information during processing')
         .boolean('bar').describe('bar', 'no progressbar')
+        .boolean('main1').describe('main1', 'main1')
         .string('collection').describe('collection', 'features collections')
-        .boolean('version').describe('version','display software version')
         .boolean('help').describe('help','print this help message'),
     argv = opt.argv,
     fs = require('fs'),
     concat = require('concat-stream'),
-    xmldom = new (require('xmldom').DOMParser)(),
-    osmxmlParser = require('./parse_osmxml.js'),
-    JSONStream = require('JSONStream'),
     osmpbfParser = require('tiny-osmpbf'),
-    geojsonNumeric = require('geojson-numeric'),
     pack = require('./package.json');
-
-if (argv.help) {
-    return opt.showHelp();
-}
-if (argv.version) {
-    process.stdout.write(pack.version+'\n');
-    return;
-}
 
 var filename = argv._[0] || '';
 
-var enhanced_geojson = argv.e;
-var format = argv.f;
 
-if (format === 'xml') format = 'osm';
-// detect file format from filename
-if (!format) {
-    if (filename.match(/\.osm$/i)) format = 'osm';
-    if (filename.match(/\.xml$/i)) format = 'osm';
-    if (filename.match(/\.json$/i)) format = 'json';
-    if (filename.match(/\.pbf$/i)) format = 'pbf';
-}
-// fall back to the native JSON parser if the file is small enough
-// (unfortunately, the streaming JSON parser isn't very fast)
-if (format === 'json' && filename) {
-    if (fs.statSync(filename).size < 268435577)
-        format = 'nativejson';
-}
-// fall back to autodetection if still no format
-if (!format) format = 'auto';
+var totalProcessed = 0;
 
-var datastream = (filename ? fs.createReadStream(filename) : process.stdin);
 
-// use streaming parsers if format is already known
-switch(format) {
-case 'json':
-case 'streamjson':
-    datastream.pipe(JSONStream.parse())
-    .on('root', function(data) {
-        // iron out some nasty floating point rounding errors
-        if (data.version) data.version = Math.round(data.version*1000)/1000;
-        data.elements.forEach(function(element) {
-            if (element.lat) element.lat = Math.round(element.lat*1E12)/1E12;
-            if (element.lon) element.lon = Math.round(element.lon*1E12)/1E12;
+var osm = parseOSM();
+var osmItems = []
+
+function main1() {
+    const MB = 1024 * 1024;
+    const stats = fs.statSync(filename)
+    const fileSizeInMB = Math.round(stats.size / MB)
+    var processedBytes = 0;
+    var readBar = null;
+    if (argv.bar) {
+        readBar = new ProgressBar({schema: 'Reading: \t:bar Time: :time. Mem used: :mem, Data: :abs',  total: fileSizeInMB, width: 40 })
+    }
+    fs.createReadStream(filename)
+        .pipe(through.obj(function(data, enc, next) {
+            processedBytes += data.length;
+            next(null, data);
+        }))
+        .pipe(osm)
+        .pipe(through.obj(function (items, enc, next) {
+            osmItems.push(...items)
+            const processedMB = Number((processedBytes / MB).toFixed(1))
+            const MBAbs = `processed ${processedMB}/${fileSizeInMB} MB`
+            if (argv.bar) {
+                readBar.update(processedMB / fileSizeInMB, {mem: usedMemory(), time: workTime(), abs: MBAbs});
+            } else {
+                console.log('Reading', osmItems.length, `processed ${MBAbs}`)
+            }
+            
+            next();
+        }))
+        .on('finish', function () {
+            console.log('total', osmItems.length)
+            logUsedMemory();
+            process.nextTick(convertParsedOSM, osmItems)
         });
-        // convert to geojson
-        convert(data);
-    })
-    .on('error', function(err) {
-       process.stderr.write("ERROR: JSON input stream could not be parsed.\n");
-       process.exit(1);
-    });
-break;
-case 'osm':
-case 'streamxml':
-    datastream
-    .on('data', function(chunk) {
-        osmxmlParser.write(chunk);
-    })
-    .on('end', function() {
-        osmxmlParser.end();
-        data = osmxmlParser.getJSON();
-        convert(data);
-    });
-    datastream.resume();
-break;
-default:
-    // otherwise use leagacy non-streaming parsers
+}
+
+function main2() {
+    var datastream = fs.createReadStream(filename);
     datastream.pipe(concat(chunkedConvertPbf));
 }
 
+// if (argv.main1) {
+//     main1();
+// } else {
+//     main2();
+// }
+
+main1();
+
 
 function usedMemory() {
-    const used = process.memoryUsage().heapUsed / 1024 / 1024;
-    return `${Math.round(used * 100) / 100} MB`
+    const used = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+    return `${used} MB`
 }
 
 function logUsedMemory() {
@@ -108,7 +91,7 @@ var startTime = new Date();
 
 function workTime() {
     var ms = new Date() - startTime;
-    return `${ms/1000}s`;
+    return `${Math.round(ms/1000)}s`;
 }
 
 
@@ -119,15 +102,14 @@ function doneCallback() {
 
 const CHUNK_SIZE = 10000;
 
+
 function chunkedConvertPbf(data) {
     console.log('Total data size', data.length)
-    var total = 0;
-    var properties = {};
     data = osmpbfParser(data);
 
     console.log('Osm parsed size', data.elements.length)
     logUsedMemory();
-    process.nextTick(convertParsedOSM, data)
+    process.nextTick(convertParsedOSM, data.elements)
 }
 
 
@@ -205,12 +187,9 @@ function dummySaver() {
 }
 
 
-var ProgressBar = require('ascii-progress');
-
-
-function convertParsedOSM(data) {
+function convertParsedOSM(elements) {
     var featureHandler = makeMongoSaver();
-    var chunkConverter = osmtogeojson(data, {});
+    var chunkConverter = osmtogeojson(elements, {});
 
     var bar = null;
     var lastStage = '';

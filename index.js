@@ -1,4 +1,4 @@
-var _ = require("./lodash.custom.js");
+var _ = require("lodash");
 var rewind = require("geojson-rewind");
 
 // see https://wiki.openstreetmap.org/wiki/Overpass_turbo/Polygon_Features
@@ -31,7 +31,7 @@ function default_deduplicator(objectA, objectB) {
 
 var osmtogeojson = {};
 
-osmtogeojson = function (json, options) {
+osmtogeojson = function (elements, options) {
     options = _.merge({
             verbose: false,
             flatProperties: true,
@@ -54,8 +54,8 @@ osmtogeojson = function (json, options) {
     var context = {
         stage: {name: 'elements', processed: 0},
 
-        elements: json.elements,
-        elementsTotal: json.elements.length,
+        elements: elements,
+        elementsTotal: elements.length,
         elementsProcessed: 0,
 
         // sort elements
@@ -111,7 +111,8 @@ function chunkedProcessStage(array, context, itemCallback, contextCallback) {
     context.stage.total = array.length;
     CHUNK_SIZE = Math.max(Math.round(context.stage.total / 20), 4000);
     for (var l=0; context.stage.processed < array.length && l < CHUNK_SIZE; context.stage.processed++, l++) {
-        itemCallback(context.stage.processed, l);
+        item = array[context.stage.processed]
+        itemCallback(context.stage.processed, item);
     }
     contextCallback(context, l, context.stage.total)
     context.stage.done = context.stage.processed >= array.length;
@@ -251,6 +252,11 @@ function _regroupElements(context, contextCallback) {
 
     for (var j=0; context.elements.length && j < CHUNK_SIZE; context.elementsProcessed++, j++) {
         var element = context.elements.pop()
+        if (element.info) {
+            _.assign(element, element.info);
+            element.info = null;
+        }
+
         switch (element.type) {
             case "node":
                 var node = element;
@@ -258,7 +264,7 @@ function _regroupElements(context, contextCallback) {
                 break;
             case "way":
                 var way = _.clone(element);
-                way.nodes = _.clone(way.nodes);
+                way.nodes = _.clone(way.nodes || way.refs);
                 ways.push(way);
                 if (way.center)
                     centerGeometry(way);
@@ -270,6 +276,7 @@ function _regroupElements(context, contextCallback) {
             case "relation":
                 var rel = _.clone(element);
                 rel.members = _.clone(rel.members);
+                rel.members.forEach(function(m) { m = _.defaults(m, {'ref': m.id}) })
                 rels.push(rel);
                 var has_full_geometry = rel.members && rel.members.some(function (member) {
                     return member.type == "node" && member.lat ||
@@ -345,8 +352,7 @@ function _convert2geoJSON(context, options, contextCallback, featureCallback) {
         var nodeids = context.nodeids;
         var poinids = context.poinids;
 
-        chunkedProcessStage(context.nodes, context, function(i, l){
-            var node = nodes[i];
+        chunkedProcessStage(context.nodes, context, function(i, node){
             if (nodeids[node.id] !== undefined) {
                 // handle input data duplication
                 node = options.deduplicator(node, nodeids[node.id]);
@@ -434,8 +440,9 @@ function _convert2geoJSON(context, options, contextCallback, featureCallback) {
                 continue; // ignore relations without members (e.g. returned by an ids_only query)
             }
             for (var j = 0; j < rel.members.length; j++) {
-                var m_type = rel.members[j].type;
-                var m_ref = rel.members[j].ref;
+                var member = rel.members[j]; 
+                var m_type = member.type;
+                var m_ref = member.ref;
                 if (typeof m_ref !== "number") {
                     // de-namespace full geometry content
                     m_ref = m_ref.replace("_fullGeom", "");
@@ -459,27 +466,29 @@ function _convert2geoJSON(context, options, contextCallback, featureCallback) {
     if (context.stage.name == 'pois') {
         var pois = context.pois;
         var relsmap = context.relsmap;
-        chunkedProcessStage(pois, context, function(i, l) {
-            if (typeof pois[i].lon == "undefined" || typeof pois[i].lat == "undefined") {
-                if (options.verbose) console.warn('POI', pois[i].type + '/' + pois[i].id, 'ignored because it lacks coordinates');
+        chunkedProcessStage(pois, context, function(i, poi) {
+            if (typeof poi.lon == "undefined" || typeof poi.lat == "undefined") {
+                if (options.verbose) console.warn('POI', poi.type + '/' + poi.id, 'ignored because it lacks coordinates');
                 return; // lon and lat are required for showing a point
             }
+
+            poi_nodes = relsmap["node"][poi.id]
             var feature = {
                 "type": "Feature",
-                "id": pois[i].type + "/" + pois[i].id,
+                "id": poi.type + "/" + poi.id,
                 "properties": {
-                    "type": pois[i].type,
-                    "id": pois[i].id,
-                    "tags": pois[i].tags || {},
-                    "relations": relsmap["node"][pois[i].id] || [],
-                    "meta": build_meta_information(pois[i])
+                    "type": poi.type,
+                    "id": poi.id,
+                    "tags": poi.tags || {},
+                    "relations": poi_nodes || [],
+                    "meta": build_meta_information(poi)
                 },
                 "geometry": {
                     "type": "Point",
-                    "coordinates": [+pois[i].lon, +pois[i].lat],
+                    "coordinates": [+poi.lon, +poi.lat],
                 }
             };
-            if (pois[i].__is_center_placeholder)
+            if (poi.__is_center_placeholder)
                 feature.properties["geometry"] = "center";
 
             featureCallback(feature);
