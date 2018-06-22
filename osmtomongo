@@ -1,0 +1,250 @@
+#!/usr/bin/env node
+
+var _ = require("lodash");
+var osmtogeojson = require('./'),
+    opt = require('optimist')
+        .usage('Usage: $0 [-f format] [-e] [-v] FILE')
+        .string('f').describe('f', 'file format. if not given, will be detected from filename. supported values: osm, json')
+        .boolean('e').describe('e', 'enhanced properties. if set, the resulting GeoJSON feature\'s properties will contain more structured information')
+        .boolean('n').describe('n', 'numeric properties. if set, the resulting GeoJSON feature\'s properties will be numbers if possible')
+        .boolean('v').describe('v', 'verbose mode. output diagnostic information during processing')
+        .boolean('bar').describe('bar', 'no progressbar')
+        .string('collection').describe('collection', 'features collections')
+        .boolean('version').describe('version','display software version')
+        .boolean('help').describe('help','print this help message'),
+    argv = opt.argv,
+    fs = require('fs'),
+    concat = require('concat-stream'),
+    xmldom = new (require('xmldom').DOMParser)(),
+    osmxmlParser = require('./parse_osmxml.js'),
+    JSONStream = require('JSONStream'),
+    osmpbfParser = require('tiny-osmpbf'),
+    geojsonNumeric = require('geojson-numeric'),
+    pack = require('./package.json');
+
+if (argv.help) {
+    return opt.showHelp();
+}
+if (argv.version) {
+    process.stdout.write(pack.version+'\n');
+    return;
+}
+
+var filename = argv._[0] || '';
+
+var enhanced_geojson = argv.e;
+var format = argv.f;
+
+if (format === 'xml') format = 'osm';
+// detect file format from filename
+if (!format) {
+    if (filename.match(/\.osm$/i)) format = 'osm';
+    if (filename.match(/\.xml$/i)) format = 'osm';
+    if (filename.match(/\.json$/i)) format = 'json';
+    if (filename.match(/\.pbf$/i)) format = 'pbf';
+}
+// fall back to the native JSON parser if the file is small enough
+// (unfortunately, the streaming JSON parser isn't very fast)
+if (format === 'json' && filename) {
+    if (fs.statSync(filename).size < 268435577)
+        format = 'nativejson';
+}
+// fall back to autodetection if still no format
+if (!format) format = 'auto';
+
+var datastream = (filename ? fs.createReadStream(filename) : process.stdin);
+
+// use streaming parsers if format is already known
+switch(format) {
+case 'json':
+case 'streamjson':
+    datastream.pipe(JSONStream.parse())
+    .on('root', function(data) {
+        // iron out some nasty floating point rounding errors
+        if (data.version) data.version = Math.round(data.version*1000)/1000;
+        data.elements.forEach(function(element) {
+            if (element.lat) element.lat = Math.round(element.lat*1E12)/1E12;
+            if (element.lon) element.lon = Math.round(element.lon*1E12)/1E12;
+        });
+        // convert to geojson
+        convert(data);
+    })
+    .on('error', function(err) {
+       process.stderr.write("ERROR: JSON input stream could not be parsed.\n");
+       process.exit(1);
+    });
+break;
+case 'osm':
+case 'streamxml':
+    datastream
+    .on('data', function(chunk) {
+        osmxmlParser.write(chunk);
+    })
+    .on('end', function() {
+        osmxmlParser.end();
+        data = osmxmlParser.getJSON();
+        convert(data);
+    });
+    datastream.resume();
+break;
+default:
+    // otherwise use leagacy non-streaming parsers
+    datastream.pipe(concat(chunkedConvertPbf));
+}
+
+
+function usedMemory() {
+    const used = process.memoryUsage().heapUsed / 1024 / 1024;
+    return `${Math.round(used * 100) / 100} MB`
+}
+
+function logUsedMemory() {
+    console.log(`The script uses approximately ${usedMemory()}`);
+}
+
+
+var startTime = new Date();
+
+
+function workTime() {
+    var ms = new Date() - startTime;
+    return `${ms/1000}s`;
+}
+
+
+function doneCallback() {
+    console.log(`Job took: ${workTime()}`);
+}
+
+
+const CHUNK_SIZE = 10000;
+
+function chunkedConvertPbf(data) {
+    console.log('Total data size', data.length)
+    var total = 0;
+    var properties = {};
+    data = osmpbfParser(data);
+
+    console.log('Osm parsed size', data.elements.length)
+    logUsedMemory();
+    process.nextTick(convertParsedOSM, data)
+}
+
+
+var MongoClient = require('mongodb').MongoClient;
+var url = "mongodb://localhost:27017/";
+
+
+function makeMongoSaver() {
+    var MongoClient = require('mongodb').MongoClient;
+    var MONGO_URL = "mongodb://localhost:27017/";
+    var mongoDB = null;
+    var database = null;
+
+    function saveFeatures(features, callback) {
+        if (!database) {
+            MongoClient.connect(MONGO_URL, function(err, db) {
+                if (err) {
+                    throw err;
+                }
+                mongoDB = db;
+                database = db.db('osm_import');
+                process.nextTick(saveFeatures, features, callback)
+            });
+            return;
+        }
+        if (!features) {
+            doneCallback()
+            return mongoDB.close();
+        } else if (features.length) {
+            database.collection(argv.collection ||  "features").insert(features, function(err, res) {
+                if (err) {
+                    console.log(err);
+                    throw err;
+                }
+                return callback();
+            })
+        } else {
+            process.nextTick(callback);
+        }
+    }
+    return saveFeatures;
+}
+
+
+function makeFileSaver() {
+    var separator = argv.m ? '' : '\n';
+    outStream = fs.createWriteStream('out.geojson')
+    outStream.write('{'+separator+'"type": "FeatureCollection",'+separator+'"features": ['+separator);
+    var totalCount = 0;
+
+    return function(features, callback) {
+        if (features) {
+            features.forEach(function (feature) {
+                outStream.write(totalCount > 0 ? ',\n' : '');
+                outStream.write(JSON.stringify(feature, null, argv.m ? 0 : 2));
+                totalCount++;
+            })
+        } else {
+            outStream.write(separator+']'+separator+'}'+separator);
+            outStream.end();
+            doneCallback();
+        }
+
+        callback();
+    }
+}
+
+function dummySaver() {
+    return function(features, callback) {
+        process.nextTick(callback)
+        if (!features) {
+            doneCallback();
+        }
+    }
+}
+
+
+var ProgressBar = require('ascii-progress');
+
+
+function convertParsedOSM(data) {
+    var featureHandler = makeMongoSaver();
+    var chunkConverter = osmtogeojson(data, {});
+
+    var bar = null;
+    var lastStage = '';
+
+    function handleProgress(context, chunkSize, total) {
+        if (lastStage != context.stage.name) {
+            if (argv.bar) {
+                bar = new ProgressBar({schema: ':stage: \t:bar Time: :time. Mem used: :mem',  total: total, width: 40 })
+            }
+            lastStage = context.stage.name;
+        }
+        if (argv.bar) {
+            bar.tick(chunkSize, {stage: lastStage, mem: usedMemory(), time: workTime()});
+        } else {
+            prentage = Math.round(100 * context.stage.processed/context.stage.total)
+            console.log(`${context.stage.name} ${prentage}%. \tMem used: ${usedMemory()}`);
+        }
+    }
+
+    function contextCallback(context, chunkSize, total) {
+        handleProgress(context, chunkSize, total)
+        global.gc();
+
+        if (context.stage.name != 'done') {
+            var features = context.featuresChunk;
+            context.featuresChunk = new Array();
+            
+            return featureHandler(features, function() {
+                process.nextTick(chunkConverter, contextCallback);
+            })
+        } else {
+            return featureHandler(null, _.identity);
+        }
+    }
+
+    chunkConverter(contextCallback);
+}

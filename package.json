@@ -28,12 +28,18 @@
   },
   "dependencies": {
     "JSONStream": "0.8.0",
+    "ascii-progress": "^1.0.5",
     "concat-stream": "~1.0.1",
     "geojson-numeric": "0.2.0",
     "geojson-rewind": "0.3.0",
     "htmlparser2": "3.5.1",
+    "lodash": "^4.17.10",
+    "mongodb": "^3.0.10",
+    "mongoose": "^5.1.6",
     "optimist": "~0.3.5",
     "osm-polygon-features": "^0.9.1",
+    "progress": "^2.0.0",
+    "progress-bar": "^0.1.1",
     "tiny-osmpbf": "^0.1.0",
     "xmldom": "~0.1.16"
   },
